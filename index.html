@@ -71,21 +71,23 @@ body{user-select:none;-webkit-user-select:none}button{font:inherit;color:inherit
 </div></section>
 </div>
 
+<div id="turnstileMount" style="position:fixed;left:-10000px;top:-10000px;width:300px;height:65px;overflow:hidden;z-index:99999"></div>
 <div class="modal" id="profileModal"><div class="dialog"><div class="dialogHead"><div><div class="title" style="font-size:27px">Your profile</div><div class="sub">No login required. Your anonymous account is created automatically.</div></div><button class="close" data-close="profileModal">✕</button></div><div class="profile"><div class="avatar" id="profileAvatar">C</div><div><div style="font-size:21px;font-weight:900" id="profileDisplay">CoolPlayer</div><div class="sub" id="profileName">coolplayer</div><div class="small" id="accountId">Local account</div></div></div><div class="profileStats"><div class="pstat"><div class="label">Best round</div><div class="value" id="pBestRound">0</div></div><div class="pstat"><div class="label">Total clicks</div><div class="value" id="pTotalClicks">0</div></div><div class="pstat"><div class="label">Best CPS</div><div class="value" id="pBestCps">0</div></div></div><div class="form"><input class="input" id="usernameInput" placeholder="Username"><input class="input" id="displayInput" placeholder="Display name"><div class="row"><button class="btn primary" id="saveProfileButton">Save profile</button><label class="btn dark" style="display:inline-flex;align-items:center;justify-content:center">Choose PFP<input id="pfpInput" type="file" accept="image/png,image/jpeg,image/webp" hidden></label></div><div id="profileMessage" class="msg muted"></div><div class="notice">Username must be unique. Display names can repeat. Username and display-name changes are limited to 2 per UTC month. This prototype enforces the rule locally until Supabase is connected.</div></div></div></div>
 
 <div class="modal" id="leaderModal"><div class="dialog"><div class="dialogHead"><div><div class="title" style="font-size:27px">Leaderboard</div><div class="sub">Local fallback now. Global mode appears once Supabase is configured.</div></div><button class="close" data-close="leaderModal">✕</button></div><div class="leaderTabs"><button class="tab active" data-board="rounds">Most rounds</button><button class="tab" data-board="clicks">Most clicks</button><button class="tab" data-board="cps">Best CPS</button></div><div id="leaderList"></div></div></div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
 <script>
 /* =========================
    SUPABASE CONFIG
    Put your public project URL, publishable key and Turnstile site key here.
    Never put a service_role key or CAPTCHA secret in this file.
 ========================= */
-const SUPABASE_URL = '';
-const SUPABASE_KEY = '';
-const TURNSTILE_SITE_KEY = '';
-const sb = (window.supabase && SUPABASE_URL && SUPABASE_KEY) ? window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY) : null;
+const SUPABASE_URL = 'https://dfacsrppzbljlhxidusm.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_1R0aFy_Gs7axWp7swTFycQ_1sftGYft';
+const TURNSTILE_SITE_KEY = '0x4AAAAAAEfTx7_shSHC5hjv';
+const sb = (window.supabase && SUPABASE_URL && SUPABASE_KEY) ? window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:false}}) : null;
 
 const SAVE='coolgames_v3';
 const DIFFS={
@@ -129,6 +131,125 @@ const VOID={
 let state={round:1,difficulty:'normal',roundClicks:0,balance:0,bestRound:0,totalClicks:0,bestCps:0,selectedMod:null,upgrades:Object.fromEntries(Object.keys(UPG).map(k=>[k,0])),void:Object.fromEntries(Object.keys(VOID).map(k=>[k,0])),voidCores:0,rebirths:0,runActive:false,savedRun:false,usedFailSafe:false,profile:{id:'',username:'',displayName:'',pfp:'',changes:{username:[],display:[]}},timeLeft:0,roundStart:0};
 let timer=null,movementTimer=null,shrinkTimer=null,currentChallenge='standard';
 
+let sbUser=null, turnstileWidgetId=null, turnstileToken=null, supabaseReady=false;
+let supabaseInitPromise=null;
+let supabaseInitDone=false;
+
+function waitForTurnstile(){
+  return new Promise((resolve,reject)=>{
+    const started=Date.now();
+    const tick=()=>{
+      if(window.turnstile && typeof window.turnstile.render==='function') return resolve();
+      if(Date.now()-started>15000) return reject(new Error('Turnstile failed to load.'));
+      setTimeout(tick,100);
+    }; tick();
+  });
+}
+async function getCaptchaToken(){
+  if(!TURNSTILE_SITE_KEY) throw new Error('Turnstile site key is missing.');
+  await waitForTurnstile();
+  return new Promise((resolve,reject)=>{
+    const mount=document.getElementById('turnstileMount');
+    if(!mount) return reject(new Error('Turnstile mount is missing.'));
+    mount.innerHTML=''; turnstileToken=null;
+    let settled=false;
+    const finish=(fn,value)=>{if(settled)return;settled=true;fn(value)};
+    try{ if(turnstileWidgetId!==null && window.turnstile.remove) window.turnstile.remove(turnstileWidgetId); }catch(e){}
+    turnstileWidgetId=null;
+    turnstileWidgetId=window.turnstile.render(mount,{
+      sitekey:TURNSTILE_SITE_KEY,
+      execution:'execute',
+      appearance:'interaction-only',
+      callback:t=>{turnstileToken=t;finish(resolve,t)},
+      'error-callback':()=>finish(reject,new Error('CAPTCHA could not be completed.')),
+      'expired-callback':()=>{turnstileToken=null}
+    });
+    try{window.turnstile.execute(turnstileWidgetId);}catch(e){finish(reject,e)}
+  });
+}
+async function initSupabase(){
+  if(supabaseInitDone) return true;
+  if(supabaseInitPromise) return supabaseInitPromise;
+  if(!sb) return false;
+  supabaseInitPromise=(async()=>{
+    try{
+      const {data,error:sessionError}=await sb.auth.getSession();
+      if(sessionError) throw sessionError;
+      if(data.session?.user){
+        sbUser=data.session.user;
+        supabaseReady=true;
+        await syncSupabaseProfile();
+        supabaseInitDone=true;
+        return;
+      }
+
+      // CAPTCHA is required by Supabase. Never attempt anonymous signup without a token.
+      const captchaToken=await getCaptchaToken();
+      const {data:authData,error}=await sb.auth.signInAnonymously({options:{captchaToken}});
+      if(error) throw error;
+      sbUser=authData.user;
+      supabaseReady=true;
+      await ensureSupabaseProfile();
+      supabaseInitDone=true;
+    }catch(e){
+      supabaseReady=false;
+      console.warn('Supabase account setup failed:',e.message);
+      $('profileName').textContent=state.profile.username||'coolplayer';
+    } finally {
+      supabaseInitPromise=null;
+    }
+  })();
+  return supabaseInitPromise;
+}
+async function ensureSupabaseProfile(){
+  if(!sbUser)return;
+  const {data,error}=await sb.rpc('ensure_profile',{p_username:state.profile.username,p_display_name:state.profile.displayName});
+  if(error){console.warn('Profile setup:',error.message);return;}
+  if(data)applyRemoteProfile(data);
+  await pushStats();
+}
+async function syncSupabaseProfile(){
+  const {data,error}=await sb.from('profiles').select('*').eq('id',sbUser.id).maybeSingle();
+  if(error){console.warn('Profile load:',error.message);return;}
+  if(!data)return ensureSupabaseProfile();
+  applyRemoteProfile(data);
+}
+function applyRemoteProfile(p){
+  state.profile.id=p.id;
+  state.profile.username=p.username;
+  state.profile.displayName=p.display_name;
+  state.profile.pfp=p.avatar_url||'';
+  state.bestRound=Math.max(state.bestRound||0,p.best_round||0);
+  state.totalClicks=Math.max(state.totalClicks||0,Number(p.total_clicks||0));
+  state.bestCps=Math.max(state.bestCps||0,Number(p.best_cps||0));
+  state.rebirths=Math.max(state.rebirths||0,p.rebirths||0);
+  save();
+}
+let lastStatsPayload='';
+let statsSyncTimer=null;
+async function pushStats(){
+  if(!sb) return;
+  if(!supabaseReady || !sbUser){
+    try{ await initSupabase(); }catch(e){ return; }
+  }
+  if(!supabaseReady||!sbUser)return;
+  const payload={
+    p_best_round:Math.max(0,Math.floor(state.bestRound||0)),
+    p_total_clicks:Math.max(0,Math.floor(state.totalClicks||0)),
+    p_best_cps:Number((state.bestCps||0).toFixed(2)),
+    p_rebirths:Math.max(0,Math.floor(state.rebirths||0))
+  };
+  const sig=JSON.stringify(payload);
+  if(sig===lastStatsPayload)return;
+  lastStatsPayload=sig;
+  const {data,error}=await sb.rpc('save_player_stats',payload);
+  if(error){lastStatsPayload='';console.warn('Stats sync:',error.message);} else if(data) applyRemoteProfile(data);
+}
+function scheduleStatsSync(){
+  clearTimeout(statsSyncTimer);
+  statsSyncTimer=setTimeout(()=>{pushStats().catch(e=>console.warn('Stats sync:',e.message));},800);
+}
+
 function load(){try{const x=JSON.parse(localStorage.getItem(SAVE));if(x){state={...state,...x,upgrades:{...state.upgrades,...x.upgrades},void:{...state.void,...x.void},profile:{...state.profile,...x.profile,changes:{...state.profile.changes,...(x.profile?.changes||{})}}}}}catch(e){} if(!state.profile.id)state.profile.id='local-'+crypto.randomUUID(); if(!state.profile.username){const n='coolplayer'+Math.floor(Math.random()*9000+1000);state.profile.username=n;state.profile.displayName='CoolPlayer';} }
 function save(){localStorage.setItem(SAVE,JSON.stringify({...state,runActive:false,savedRun:state.runActive||state.savedRun}))}
 load();
@@ -162,7 +283,7 @@ function stopRound(){if(timer){clearInterval(timer);timer=null}if(movementTimer)
 function clickValue(){let v=1+state.upgrades.power+state.void.core;if(Math.random()<(5+3*state.upgrades.crit)/100)v*=4;if(state.void.core>=4&&Math.random()<.01)v*=8;const sec=state.timeLeft; if(sec<=2)v*=1+state.upgrades.focus;if(state.upgrades.frenzy&&sec>activeTime()-2)v*=1.5;if(state.upgrades.jackpot&&Math.random()<.02)v+=Math.max(100,Math.floor(effectiveTarget()*.1));return v;}
 $('targetBtn').addEventListener('click',()=>{if(!state.runActive)return;let v=clickValue();state.roundClicks+=v;state.totalClicks+=v;state.roundClicks=Math.round(state.roundClicks*10)/10;$('roundClicks').textContent=fmt(state.roundClicks);$('balanceValue').textContent=fmt(state.balance);$('targetBtn').classList.remove('hit');void $('targetBtn').offsetWidth;$('targetBtn').classList.add('hit');});
 
-function finishAtZero(){stopRound();const target=effectiveTarget();const passed=state.roundClicks>=target;if(passed){let earned=Math.floor(state.roundClicks);if(state.upgrades.combo)earned+=Math.floor(state.roundClicks/10)*(5+5*state.upgrades.combo)*(1+.25*state.void.voidcombo);if(state.upgrades.lucky)earned+=Math.floor(state.roundClicks/25)*(20*state.upgrades.lucky);if(state.upgrades.bank)earned=Math.floor(earned*1.1);if(state.upgrades.surge)earned=Math.floor(earned*1.25);if(state.upgrades.titan)earned=Math.floor(earned*1.2);if(state.upgrades.infinity)earned*=2;earned=Math.floor(earned*DIFFS[state.difficulty].mult);if(state.selectedMod)earned=Math.floor(earned*MODS[state.selectedMod].reward);earned=Math.floor(earned*(1+.05*state.void.overdrive));earned=Math.floor(earned*Math.pow(1.15,state.void.genesis));state.balance+=earned;state.bestCps=Math.max(state.bestCps,state.roundClicks/Math.max(1,activeTime()));state.bestRound=Math.max(state.bestRound,state.round);state.round+=1;state.selectedMod=null;save();showSuccess(earned,target);}else showFailure(target);}
+function finishAtZero(){stopRound();const target=effectiveTarget();const passed=state.roundClicks>=target;if(passed){let earned=Math.floor(state.roundClicks);if(state.upgrades.combo)earned+=Math.floor(state.roundClicks/10)*(5+5*state.upgrades.combo)*(1+.25*state.void.voidcombo);if(state.upgrades.lucky)earned+=Math.floor(state.roundClicks/25)*(20*state.upgrades.lucky);if(state.upgrades.bank)earned=Math.floor(earned*1.1);if(state.upgrades.surge)earned=Math.floor(earned*1.25);if(state.upgrades.titan)earned=Math.floor(earned*1.2);if(state.upgrades.infinity)earned*=2;earned=Math.floor(earned*DIFFS[state.difficulty].mult);if(state.selectedMod)earned=Math.floor(earned*MODS[state.selectedMod].reward);earned=Math.floor(earned*(1+.05*state.void.overdrive));earned=Math.floor(earned*Math.pow(1.15,state.void.genesis));state.balance+=earned;state.bestCps=Math.max(state.bestCps,state.roundClicks/Math.max(1,activeTime()));state.bestRound=Math.max(state.bestRound,state.round);state.round+=1;state.selectedMod=null;save();scheduleStatsSync();showSuccess(earned,target);}else showFailure(target);}
 function showSuccess(earned,target){$('resultPanel').style.display='block';$('shopPanel').style.display='block';$('resultTitle').textContent='ROUND COMPLETE';$('resultText').innerHTML=`Target <b>${fmt(target)}</b> · You got <b>${fmt(state.roundClicks)}</b>.<br><span class="good">+${fmt(earned)} clicks</span> added to your shop balance.`;$('resultActions').innerHTML=`<button class="btn primary" id="openShopFromResult">Open upgrades →</button>`;$('openShopFromResult').onclick=()=>{$('resultPanel').scrollIntoView({behavior:'smooth',block:'start'});renderAllShop();};renderAllShop();save();}
 function showFailure(target){$('resultPanel').style.display='block';$('shopPanel').style.display='none';$('resultTitle').textContent='YOU FAILED';$('resultText').innerHTML=`Required <b>${fmt(target)}</b> · You got <b>${fmt(state.roundClicks)}</b>.<br><span class="bad">Round ${state.round} stays locked.</span><br><span class="muted">You cannot buy upgrades or advance from a failed round.</span>`;$('resultActions').innerHTML=`<button class="btn primary" id="retryBtn">Retry</button><button class="btn danger" id="retryFullBtn">Retry completely</button><button class="btn dark" id="failureHomeBtn">Home</button>`;$('retryBtn').onclick=()=>{state.runActive=true;beginRound(false);$('resultPanel').style.display='none';};$('retryFullBtn').onclick=()=>{fullResetRun();$('resultPanel').style.display='none';$('shopPanel').style.display='none';$('startPanel').style.display='block';selectDifficulty(state.difficulty);$('playArea').style.display='none';};$('failureHomeBtn').onclick=()=>{state.savedRun=true;save();showView('home')};save();}
 function fullResetRun(){stopRound();state.round=1;state.roundClicks=0;state.balance=0;state.bestRound=0;state.totalClicks=0;state.bestCps=0;state.selectedMod=null;state.savedRun=false;state.usedFailSafe=false;Object.keys(state.upgrades).forEach(k=>state.upgrades[k]=0);save();}
@@ -172,7 +293,7 @@ function buyUpgrade(id){const u=UPG[id],lv=state.upgrades[id]||0,cost=typeof u.c
 function renderUpgrades(){const host=$('upgradesView');host.innerHTML='';const section=document.createElement('div');section.className='section';section.innerHTML='<div class="sectionHead"><div><div class="sectionTitle">Normal Upgrades</div><div class="sectionSub">Repeatables + one-time upgrades. Final normal upgrade costs 50,000,000 clicks.</div></div><div class="small">Balance: '+fmt(state.balance)+'</div></div><div class="shopGrid" id="normalGrid"></div>';host.appendChild(section);const g=section.querySelector('#normalGrid');Object.entries(UPG).forEach(([id,u])=>{const lv=state.upgrades[id]||0;const maxed=(u.kind==='repeat'&&lv>=u.max)||(u.kind==='one'&&lv>0);const cost=typeof u.cost==='function'?u.cost(lv):u.cost;const d=document.createElement('div');d.className='upgrade '+(maxed?'maxed':'');d.innerHTML=`<div><div class="uName">${u.icon} ${u.name}</div><div class="uDesc">${u.desc(state)}</div><div class="uCost">${maxed?'MAXED':fmt(cost)+' clicks'}</div></div><button class="btn buy" data-buy="${id}" ${maxed?'disabled':''}>${maxed?'Maxed':'Buy'}</button>`;d.querySelector('button').addEventListener('click',()=>buyUpgrade(id));g.appendChild(d);});}
 function renderModifiers(){const host=$('modifiersView');host.innerHTML='';const section=document.createElement('div');section.className='section';section.innerHTML='<div class="sectionHead"><div><div class="sectionTitle">Risky Modifiers</div><div class="sectionSub">They cost clicks before the round starts. One modifier per round.</div></div><div class="small">Selected: '+(state.selectedMod?MODS[state.selectedMod].name:'None')+'</div></div><div class="modGrid"></div>';host.appendChild(section);const g=section.querySelector('.modGrid');Object.entries(MODS).forEach(([id,m])=>{const d=document.createElement('div');d.className='mod'+(state.selectedMod===id?' selected':'');d.innerHTML=`<span class="modBadge">${fmt(m.cost)} clicks</span><div class="modName">${m.icon} ${m.name}</div><div class="modDesc">${m.desc}</div><div class="modCost">${state.balance>=m.cost?'Available':'Need '+fmt(m.cost-state.balance)+' more'}</div>`;d.addEventListener('click',()=>{if(state.balance<m.cost){d.classList.add('shake');setTimeout(()=>d.classList.remove('shake'),450);return}if(state.selectedMod===id){state.selectedMod=null;renderModifiers();return}if(state.selectedMod){state.balance+=MODS[state.selectedMod].cost;state.selectedMod=null}state.balance-=m.cost;state.selectedMod=id;renderAllShop();save();});g.appendChild(d);});}
 function rebirthCost(){return Math.floor(50000*Math.pow(3,state.rebirths));}
-function renderRebirth(){const h=$('rebirthView');h.innerHTML=`<div class="rebirthBox"><div class="title" style="font-size:26px">Rebirth</div><div class="sub" style="margin-top:5px">Reset your normal run to gain permanent Void Cores. Your Void upgrades stay forever.</div><div class="rebirthCost">Next rebirth: <b>${fmt(rebirthCost())} clicks</b> · Current rebirths: <b>${state.rebirths}</b></div><div class="rebirthCard"><div class="rebirthNote"><b>Resets:</b> round, click balance, normal upgrades and selected modifier.<br><b>Keeps:</b> rebirths, Void Cores and all Void upgrades.</div><div class="actions" style="justify-content:flex-start"><button class="btn danger" id="doRebirth">Rebirth →</button></div></div></div>`;h.querySelector('#doRebirth').addEventListener('click',()=>{const c=rebirthCost();if(state.balance<c){const b=h.querySelector('#doRebirth');b.classList.add('shake');setTimeout(()=>b.classList.remove('shake'),450);return}state.rebirths++;state.voidCores+=1;state.round=1;state.balance=0;state.selectedMod=null;Object.keys(state.upgrades).forEach(k=>state.upgrades[k]=0);state.savedRun=true;renderAllShop();save();});}
+function renderRebirth(){const h=$('rebirthView');h.innerHTML=`<div class="rebirthBox"><div class="title" style="font-size:26px">Rebirth</div><div class="sub" style="margin-top:5px">Reset your normal run to gain permanent Void Cores. Your Void upgrades stay forever.</div><div class="rebirthCost">Next rebirth: <b>${fmt(rebirthCost())} clicks</b> · Current rebirths: <b>${state.rebirths}</b></div><div class="rebirthCard"><div class="rebirthNote"><b>Resets:</b> round, click balance, normal upgrades and selected modifier.<br><b>Keeps:</b> rebirths, Void Cores and all Void upgrades.</div><div class="actions" style="justify-content:flex-start"><button class="btn danger" id="doRebirth">Rebirth →</button></div></div></div>`;h.querySelector('#doRebirth').addEventListener('click',()=>{const c=rebirthCost();if(state.balance<c){const b=h.querySelector('#doRebirth');b.classList.add('shake');setTimeout(()=>b.classList.remove('shake'),450);return}state.rebirths++;state.voidCores+=1;state.round=1;state.balance=0;state.selectedMod=null;Object.keys(state.upgrades).forEach(k=>state.upgrades[k]=0);state.savedRun=true;renderAllShop();save();scheduleStatsSync();});}
 function buyVoid(id){const v=VOID[id],lv=state.void[id];if(lv>=v.cost.length)return;const c=v.cost[lv];if(state.voidCores<c){const el=document.querySelector(`[data-void="${id}"]`);if(el){el.classList.add('broke');setTimeout(()=>el.classList.remove('broke'),450)}return}state.voidCores-=c;state.void[id]++;renderVoid();save();}
 function renderVoid(){const h=$('voidView');h.innerHTML=`<div class="section"><div class="sectionHead"><div><div class="sectionTitle">Void Upgrades</div><div class="sectionSub">Permanent upgrades powered by Void Cores. These survive every rebirth.</div></div><div class="small">🔮 ${state.voidCores} cores</div></div><div class="voidGrid"></div></div>`;const g=h.querySelector('.voidGrid');Object.entries(VOID).forEach(([id,v])=>{const lv=state.void[id],max=v.cost.length,maxed=lv>=max,cost=v.cost[lv];const d=document.createElement('div');d.className='voidItem '+(maxed?'maxed':'');d.innerHTML=`<div class="uName">${v.icon} ${v.name}</div><div class="uDesc">${v.desc}</div><div class="uCost">Level ${lv}/${maxed?max: max} · ${maxed?'MAXED':cost+' core'+(cost===1?'':'s')}</div><button class="btn buy" data-void="${id}" ${maxed?'disabled':''}>${maxed?'Maxed':'Buy'}</button>`;d.querySelector('button').addEventListener('click',()=>buyVoid(id));g.appendChild(d);});}
 
@@ -180,18 +301,77 @@ function setShopTab(tab){['upgrades','modifiers','rebirth','void'].forEach(x=>{$
 $('upgradesTab').onclick=()=>setShopTab('upgrades');$('modifiersTab').onclick=()=>setShopTab('modifiers');$('rebirthTab').onclick=()=>setShopTab('rebirth');$('voidTab').onclick=()=>setShopTab('void');
 $('nextRoundButton').onclick=()=>{state.round+=0;state.runActive=true;$('resultPanel').style.display='none';$('shopPanel').style.display='none';beginRound(false);};
 
-$('profileBtn').onclick=()=>openProfile();$('leaderBtn').onclick=()=>openLeaderboard();document.querySelectorAll('[data-close]').forEach(b=>b.addEventListener('click',()=>$(b.dataset.close).classList.remove('show')));
-function openProfile(){$('usernameInput').value=state.profile.username;$('displayInput').value=state.profile.displayName;$('profileDisplay').textContent=state.profile.displayName||'CoolPlayer';$('profileName').textContent=state.profile.username||'coolplayer';$('accountId').textContent=state.profile.id; $('pBestRound').textContent=state.bestRound;$('pTotalClicks').textContent=fmt(state.totalClicks);$('pBestCps').textContent=state.bestCps.toFixed(1);$('profileAvatar').innerHTML=state.profile.pfp?`<img src="${state.profile.pfp}" alt="">`:(state.profile.displayName||'C').charAt(0).toUpperCase();$('profileMessage').textContent='';$('profileModal').classList.add('show');}
+$('profileBtn').onclick=()=>{openProfile().catch(e=>profileMsg(e.message||'Profile failed to load.','bad'));};$('leaderBtn').onclick=()=>openLeaderboard();document.querySelectorAll('[data-close]').forEach(b=>b.addEventListener('click',()=>$(b.dataset.close).classList.remove('show')));
+async function openProfile(){ if(sb && !supabaseReady) await initSupabase(); $('usernameInput').value=state.profile.username;$('displayInput').value=state.profile.displayName;$('profileDisplay').textContent=state.profile.displayName||'CoolPlayer';$('profileName').textContent=state.profile.username||'coolplayer';$('accountId').textContent=state.profile.id; $('pBestRound').textContent=state.bestRound;$('pTotalClicks').textContent=fmt(state.totalClicks);$('pBestCps').textContent=state.bestCps.toFixed(1);$('profileAvatar').innerHTML=state.profile.pfp?`<img src="${state.profile.pfp}" alt="">`:(state.profile.displayName||'C').charAt(0).toUpperCase();$('profileMessage').textContent='';$('profileModal').classList.add('show');}
 function monthKey(){const d=new Date();return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0');}function canChange(field,newVal){if(newVal===state.profile[field])return true;const key=monthKey();const arr=(state.profile.changes[field]||[]).filter(x=>x.startsWith(key));return arr.length<2;}
-$('saveProfileButton').onclick=()=>{const un=$('usernameInput').value.trim().toLowerCase(),dn=$('displayInput').value.trim();if(!/^[a-z0-9_]{3,18}$/.test(un))return profileMsg('Username must be 3-18 letters, numbers or underscores.','bad');const banned=['admin','owner','moderator','support','fuck','shit','nigger','nazi'];if(banned.some(x=>un.includes(x)||dn.toLowerCase().includes(x)))return profileMsg('That name is not allowed.','bad');if(!canChange('username',un))return profileMsg('Username changes used up for this UTC month.','bad');if(!canChange('displayName',dn))return profileMsg('Display-name changes used up for this UTC month.','bad');const lower=un;const rows=JSON.parse(localStorage.getItem('coolgames_reserved_names')||'[]');const owner=rows.find(x=>x.name===lower);if(owner&&owner.id!==state.profile.id)return profileMsg('Someone already has that username.','bad');if(state.profile.username!==un){state.profile.changes.username.push(monthKey());rows.push({name:lower,id:state.profile.id});}if(state.profile.displayName!==dn)state.profile.changes.display.push(monthKey());state.profile.username=un;state.profile.displayName=dn;localStorage.setItem('coolgames_reserved_names',JSON.stringify(rows.filter((x,i,a)=>a.findIndex(y=>y.name===x.name)===i)));save();openProfile();profileMsg('Yep. All good. Profile saved.','good');};
+async function saveProfileRemote(){
+  const un=$('usernameInput').value.trim().toLowerCase(), dn=$('displayInput').value.trim();
+  if(!/^[a-z0-9_]{3,18}$/.test(un)) return profileMsg('Username must be 3-18 letters, numbers or underscores.','bad');
+  const banned=['admin','owner','moderator','support','fuck','shit','nazi'];
+  if(banned.some(x=>un.includes(x)||dn.toLowerCase().includes(x))) return profileMsg('That name is not allowed.','bad');
+  if(!supabaseReady){
+    if(!canChange('username',un))return profileMsg('Username changes used up for this UTC month.','bad');
+    if(!canChange('displayName',dn))return profileMsg('Display-name changes used up for this UTC month.','bad');
+    state.profile.username=un;state.profile.displayName=dn;save();return profileMsg('Saved locally.','good');
+  }
+  const oldU=state.profile.username, oldD=state.profile.displayName;
+  let avatar=state.profile.pfp||null;
+  if(sb && !supabaseReady) await initSupabase();
+  if(!supabaseReady) return profileMsg('Account is still connecting. Please try again.', 'bad');
+  const {data:errorCheck,error:checkError}=await sb.from('profiles').select('id').eq('username',un).maybeSingle();
+  if(checkError) return profileMsg(checkError.message||'Could not check username.','bad');
+  if(errorCheck && errorCheck.id!==sbUser.id) return profileMsg('Someone already has that username.','bad');
+  const {data,error}=await sb.rpc('update_profile',{p_username:un,p_display_name:dn,p_avatar_url:avatar});
+  if(error){
+    const msg=(error.message||'').replace(/^.*exception /i,'');
+    return profileMsg(msg||'That profile could not be saved.','bad');
+  }
+  applyRemoteProfile(data);
+  state.profile.changes=state.profile.changes||{username:[],display:[]};
+  if(oldU!==un)state.profile.changes.username.push(monthKey());
+  if(oldD!==dn)state.profile.changes.display.push(monthKey());
+  save();openProfile();profileMsg('Yep. All good. Profile saved.','good');
+}
+$('saveProfileButton').onclick=saveProfileRemote;
 function profileMsg(t,c){$('profileMessage').textContent=t;$('profileMessage').className='msg '+c;}
-$('pfpInput').onchange=e=>{const f=e.target.files?.[0];if(!f)return;if(!['image/png','image/jpeg','image/webp'].includes(f.type)||f.size>2*1024*1024){return profileMsg('PFP must be PNG, JPG or WebP and under 2 MB.','bad')}const r=new FileReader();r.onload=()=>{state.profile.pfp=r.result;save();openProfile();profileMsg('PFP saved.','good')};r.readAsDataURL(f);};
+$('pfpInput').onchange=async e=>{
+  const f=e.target.files?.[0];if(!f)return;
+  if(!['image/png','image/jpeg','image/webp'].includes(f.type)||f.size>2*1024*1024)return profileMsg('PFP must be PNG, JPG or WebP and under 2 MB.','bad');
+  if(!supabaseReady)return profileMsg('Account is still connecting. Try again in a moment.','bad');
+  try{
+    const path=`${sbUser.id}/${crypto.randomUUID()}.${f.type.split('/')[1].replace('jpeg','jpg')}`;
+    const {error}=await sb.storage.from('avatars').upload(path,f,{cacheControl:'3600',upsert:false,contentType:f.type});
+    if(error)throw error;
+    const {data:pub}=sb.storage.from('avatars').getPublicUrl(path);
+    const {data,error:updateError}=await sb.rpc('update_profile',{p_username:state.profile.username,p_display_name:state.profile.displayName,p_avatar_url:pub.publicUrl});
+    if(updateError)throw updateError;
+    applyRemoteProfile(data);openProfile();profileMsg('PFP saved.','good');
+  }catch(err){profileMsg(err.message||'PFP upload failed.','bad');}
+};
 
-let boardMode='rounds';const demoBoard=[{name:'ClickGoblin',display:'Click Goblin',round:42,clicks:180243,cps:29.7},{name:'VoidRat',display:'Void Rat',round:31,clicks:113921,cps:25.4},{name:'MouseDestroyer',display:'Mouse Destroyer',round:24,clicks:82441,cps:23.8}];
-function openLeaderboard(){renderLeaderboard();$('leaderModal').classList.add('show');}
-function renderLeaderboard(){let arr=[...demoBoard,{name:state.profile.username,display:state.profile.displayName,round:state.bestRound||0,clicks:state.totalClicks||0,cps:state.bestCps||0}];arr.sort((a,b)=>boardMode==='rounds'?b.round-a.round:boardMode==='clicks'?b.clicks-a.clicks:b.cps-a.cps);$('leaderList').innerHTML=arr.slice(0,10).map((x,i)=>`<div class="leaderRow"><div class="rank">#${i+1}</div><div class="miniAv">${(x.display||x.name||'?').charAt(0).toUpperCase()}</div><div class="grow"><div style="font-weight:850">${escapeHtml(x.display||x.name)}</div><div class="small">@${escapeHtml(x.name)}</div></div><div style="text-align:right"><div style="font-weight:900">${boardMode==='rounds'?fmt(x.round):boardMode==='clicks'?fmt(x.clicks):x.cps.toFixed(1)+' CPS'}</div><div class="small">${x.round?`Round ${fmt(x.round)}`:''}</div></div></div>`).join('');}
+let boardMode='rounds';
+async function openLeaderboard(){ $('leaderModal').classList.add('show'); if(sb && !supabaseReady) await initSupabase(); await renderLeaderboard(); }
+async function renderLeaderboard(){
+  const host=$('leaderList');host.innerHTML='<div class="small">Loading leaderboard…</div>';
+  if(supabaseReady){
+    const col=boardMode==='rounds'?'best_round':boardMode==='clicks'?'total_clicks':'best_cps';
+    const {data,error}=await sb.from('profiles').select('username,display_name,avatar_url,best_round,total_clicks,best_cps').order(col,{ascending:false}).limit(10);
+    if(!error){
+      host.innerHTML=(data||[]).map((x,i)=>`<div class="leaderRow"><div class="rank">#${i+1}</div><div class="miniAv">${x.avatar_url?`<img src="${escapeHtml(x.avatar_url)}" alt="">`:(x.display_name||x.username||'?').charAt(0).toUpperCase()}</div><div class="grow"><div style="font-weight:850">${escapeHtml(x.display_name||x.username)}</div><div class="small">@${escapeHtml(x.username)}</div></div><div style="text-align:right"><div style="font-weight:900">${boardMode==='rounds'?fmt(x.best_round):boardMode==='clicks'?fmt(x.total_clicks):Number(x.best_cps||0).toFixed(1)+' CPS'}</div><div class="small">${x.best_round?`Round ${fmt(x.best_round)}`:''}</div></div></div>`).join('')||'<div class="small">No players yet.</div>';
+      return;
+    }
+  }
+  let arr=[...demoBoard,{name:state.profile.username,display:state.profile.displayName,round:state.bestRound||0,clicks:state.totalClicks||0,cps:state.bestCps||0}];
+  arr.sort((a,b)=>boardMode==='rounds'?b.round-a.round:boardMode==='clicks'?b.clicks-a.clicks:b.cps-a.cps);
+  host.innerHTML=arr.slice(0,10).map((x,i)=>`<div class="leaderRow"><div class="rank">#${i+1}</div><div class="miniAv">${(x.display||x.name||'?').charAt(0).toUpperCase()}</div><div class="grow"><div style="font-weight:850">${escapeHtml(x.display||x.name)}</div><div class="small">@${escapeHtml(x.name)}</div></div><div style="text-align:right"><div style="font-weight:900">${boardMode==='rounds'?fmt(x.round):boardMode==='clicks'?fmt(x.clicks):x.cps.toFixed(1)+' CPS'}</div><div class="small">${x.round?`Round ${fmt(x.round)}`:''}</div></div></div>`).join('');
+}
+function openProfile(){ $('usernameInput').value=state.profile.username;$('displayInput').value=state.profile.displayName;$('profileDisplay').textContent=state.profile.displayName||'CoolPlayer';$('profileName').textContent='@'+(state.profile.username||'coolplayer');$('accountId').textContent=supabaseReady?sbUser.id:state.profile.id;$('pBestRound').textContent=state.bestRound;$('pTotalClicks').textContent=fmt(state.totalClicks);$('pBestCps').textContent=state.bestCps.toFixed(1);$('profileAvatar').innerHTML=state.profile.pfp?`<img src="${escapeHtml(state.profile.pfp)}" alt="">`:(state.profile.displayName||'C').charAt(0).toUpperCase();$('profileMessage').textContent='';$('profileModal').classList.add('show');}
+
+const demoBoard=[{name:'ClickGoblin',display:'Click Goblin',round:42,clicks:180243,cps:29.7},{name:'VoidRat',display:'Void Rat',round:31,clicks:113921,cps:25.4},{name:'MouseDestroyer',display:'Mouse Destroyer',round:24,clicks:82441,cps:23.8}];
 function escapeHtml(s){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
 document.querySelectorAll('[data-board]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-board]').forEach(x=>x.classList.remove('active'));b.classList.add('active');boardMode=b.dataset.board;renderLeaderboard();});
+
+// Supabase is initialized lazily when profile/leaderboard or score sync actually needs it.
 
 // Save current progress periodically and render initial shop state.
 setInterval(()=>{if(state.runActive)save()},5000);
